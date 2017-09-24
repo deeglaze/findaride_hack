@@ -29,8 +29,6 @@ function limited_availability(service, knowns) {
     return false;
 }
 
-var dayCode = ["Su", "M", "Tu", "W", "Th", "F", "Sa"];
-
 function setHHMM24h(hhmm, date) {
     "use strict";
     var parts = hhmm.split(":");
@@ -47,6 +45,8 @@ function IsInTimeRangeString(range, datetime) {
     return setHHMM24h(parts[0], start_time) <= datetime &&
            setHHMM24h(parts[1], end_time) >= datetime;
 }
+
+var dayCode = ["Su", "M", "Tu", "W", "Th", "F", "Sa"];
 
 function IsInServiceInterval(service, datetime) {
     "use strict";
@@ -66,8 +66,8 @@ function IsInServiceInterval(service, datetime) {
     return times.some(function (days_time) {
         var parts = days_time.split("@");
         var days = parts[0].split("/");
-        document.write("Trying " + days + ", " + parts[1] + ", " + datetime + "<br/>\n");
-        return days.include(theDay) && IsInTimeRangeString(parts[1].trim(), datetime);
+        var result = days.includes(theDay) && IsInTimeRangeString(parts[1].trim(), datetime);
+        return result;
     });
 }
 
@@ -82,12 +82,28 @@ function TimeIsServiceable(service, datetime) {
 }
 
 // Complete match, complete insatisfiability, and many reasons maybe.
-function CombineResults(result0, result1) {
+function AndResults(result0, result1) {
     "use strict";
     if (result0 === false || result1 === false) {
         return false;
     }
     if (result1 === true && result1 === true) {
+        return true;
+    }
+    var incomplete0 = result0.hasOwnProperty("incomplete") ? result0["incomplete"] : [];
+    var incomplete1 = result1.hasOwnProperty("incomplete") ? result1["incomplete"] : [];
+    return {"incomplete": incomplete0.concat(incomplete1)};
+}
+
+function OrResults(result0, result1) {
+    "use strict";
+    if (result0 === false) {
+        return result1;
+    }
+    if (result1 === false) {
+        return result0;
+    }
+    if (result0 === true || result1 === true) {
         return true;
     }
     var incomplete0 = result0.hasOwnProperty("incomplete") ? result0["incomplete"] : [];
@@ -109,12 +125,12 @@ function Available(service, knowns) {
         return 0;  // no match.
     }
     var time = new Date();
-    if (knowns.hasOwnProperty("Depart-at")) {
-        time = knowns["Depart-at"];
+    if (knowns.hasOwnProperty("depart-at")) {
+        time = knowns["depart-at"];
     }
-    // TODO: needs advance notice?
-    return CombineResults(TimeIsServiceable(service, time),
-                          Eligible(service, knowns));
+    return AndResults(TimeIsServiceable(service, time),
+             AndResults(TripWithinAdvanceNotice(service, knowns),
+                        Eligible(service, knowns)));
 }
 
 function AvailableServices(services, knowns) {
@@ -133,6 +149,196 @@ function AvailableServices(services, knowns) {
     return {"complete": complete, "incomplete": incomplete};
 }
 
+// For the time duration time1 - time0, calculate the number of elapsed business days.
+function BusinessDayDifference(time0, time1) {
+  // 1. Get the total number of whole days between the two dates
+  // 2. Divide by 7 to get the number of whole weeks
+  // 3. Multiply the number of weeks by two to get the number of weekend days
+  // 4. Subtract the number of weekend days from the whole to get business days
+  var negative = time0 > time1;
+  if (negative) {
+    var temp = time0;
+    time0 = time1;
+    time1 = temp;
+  }
+  var dayGranularity0 = new Date(time0.getYear(), time0.getMonth(), time0.getDate());
+  var dayGranularity1 = new Date(time1.getYear(), time1.getMonth(), time1.getDate());
+  var milliseconds = dayGranularity1 - dayGranularity0;
+  // Daylight savings time boundaries be DAMNED!
+  var days = milliseconds / (1000 * 60 * 60 * 24);
+  var weeks = Math.floor(days / 7);
+  var weekend_days = weeks * 2;
+  var business_days = days - weekend_days;
+
+  // Edge case correction:
+  // 5. If the number of total days is not an even number of weeks,
+  //    add the number of weeks * 7 to the start date to get a temp date
+  // 6. While the temp date is less than the end date:
+  //    a. if the temp date is not a Saturday or Sunday, add one to the business days
+  //    b. add one to the temp date.
+  if (days % 7 != 0) {
+    var temp = new Date(dayGranularity0);
+    temp.setDate(temp.getDate() + (weeks * 7));
+    while (temp < dayGranularity1) {
+      if (temp.getDay() < 5) {  // Saturday, Sunday are 5, 6.
+        ++business_days;
+      }
+      temp.setDate(temp.getDate() + 1);
+    }
+  }
+  return negative ? -business_days : business_days;
+}
+
+/*
+Advance notice notes are very particular, so we create a little DSL to describe some
+common constraints. The rest we match incompletely.
+
+Call x time in advance of the trip.
+No greater than y time in advance.
+Advance notice only if z needs satisfaction.
+w needs satisfaction to even check for within a time period.	
+
+x, y are time durations in
+  <Number>d    days,
+  <Number>b    business days,
+  <Number>h    hours (within service hours)
+
+advance-notice-notes is an array
+  if more than 1 entry, the first entry should be a
+   - Must: comma-separated constraints (satisfy all)
+   - Unless: comma-separated constraints (satisfy any)
+  the later entries should be notice time conditions
+   - <Day code>]HH:MM   The previous week's day, at or before HH:MM in service hours.
+   - >=<Duration>   At least that amount of time in advance.
+   - <=<Duration>   No more than this amount of time in advance.
+
+    
+Contraints 
+  ADA   (compliant vehicle)
+  [HH:MM    (trip is after the given time)
+  Veteran   (passenger is a veteran)
+  Today    Must call the same day
+  Morning   Must call the day of and before noon.
+
+*/
+function TimeIsToday(time) {
+  var now = new Date();
+  return (new Date(time.getYear(), time.getMonth(), time.getDate())) ==
+         (new Date(now.getYear(), now.getMonth(), now.getDate()));
+
+}
+
+function SatisfiesCondition(condition, knowns) {
+  if (condition === "Today") {
+    return TimeIsToday(knowns["depart-at"]);
+  }
+  if (condition === "Morning") {
+    return TimeIsToday(knowns["depart-at"]) && knowns["depart-at"].getHours() < 12;
+  }
+  if (condition.startsWith("[")) {
+    var sameDay = new Date(time.getYear(), time.getMonth(), time.getDate());
+    var parts = condition.substring(1).split(":");
+    sameDay.setHours(Number(parts[0]));
+    sameDay.setMinutes(Number(parts[1]));
+    return knowns["depart-at"] >= sameDay;
+  }
+  // TODO: ADA and Vetern status.
+  return {"incomplete": [condition]};
+}
+
+function DurationPrior(duration, time) {
+  duration = duration.trim();
+  var number = duration.substring(0, duration.length - 1);
+  if (duration.endsWith("b")) {
+    var result = new Date(time);
+    var business_days = Number(number);
+    result.setDate(result.getDate() - business_days);
+    // Business days <= Days, so subtract days and then adjust to get to
+    // the requisite business days.
+    while (BusinessDayDifference(result, time) < business_days) {
+      result.setDate(result.getDate() - 1);
+    }
+    return result;
+  } else if (duration.endsWith("d")) {
+    // Days
+    var result = new Date(time);
+    result.setDate(result.getDate() - Number(number));
+    return result;
+  } else if (duration.endsWith("h")) {
+    // TODO: If not in service hours, wrap back to latest possible service time.
+    var result = new Date(time);
+    result.setHours(result.getHours() - Number(number));
+    return result;
+  } else {
+    alert("Internal error: bad duration " + duration);
+  }
+}
+		    
+function AdvanceTime(time_constraint, knowns) {
+  var less = true;
+  var duration = "";
+  var prior = new Date();
+  if (time_constraint.startsWith(">=")) {
+    less = false;
+    prior = DurationPrior(time_constraint.substring(2), prior);
+  } else if (time_constraint.startsWith("<=")) {
+    less = true;
+    prior = DurationPrior(time_constraint.substring(2), prior);
+  } else {
+    // Set time to Sunday and subtract (7 - dayCode[day]) days to
+    // get to the previous week's day.
+    // then set hours and minutes.
+    prior.setDay(0);
+    var parts = time_constraint.split("]");
+    var hhmm = parts[1].split(":");
+    prior.setDate(prior.getDate() - (7 - dayCode[parts[0]]));
+    prior.setHours(Number(hhmm[0]));
+    prior.setMinutes(Number(hhmm[1]));
+  }
+
+  return less ? prior <= knowns["depart-at"] : prior >= knowns["depart-at"];
+}
+
+function TripWithinAdvanceNotice(service, knowns) {
+  if (!service.hasOwnProperty("advance-notice-notes"))
+    return true;
+
+  var notice = service["advance-notice-notes"];
+  if (0 === notice.length || "None" === notice[0]) {
+    return true;
+  }
+  var then = knowns["depart-at"];
+  if (then < new Date()) {
+    return false;  // Can't book in the past.
+  }
+  var checkTimesFrom = 0;
+  // TODO: make unless, must object keys so we can have both unless and must constraints.
+  if (notice[0].startsWith("Unless:")) {
+    var conditions = notice[0].substring(7).trim().split(",");
+    if (!conditions.reduce(function (result, condition) {
+          return OrResults(SatisfiesCondition(condition, knowns), result);
+        }, false)) {
+      return true;  // Advance notice not needed.
+    }
+    checkTimesFrom = 1;
+  }
+  if (notice[0].startsWith("Must:")) {
+    var conditions = notice[0].substring(5).trim().split(",");
+    if (!conditions.reduce(function (result, condition) {
+          return AndResults(SatisfiesCondition(condition, knowns), result);
+        }, true)) {
+      return false;  // Not eligible for service.
+    }
+    checkTimesFrom = 1;
+  }
+  if (notice[0].startsWith("Data missing:")) {
+    return {"incomplete": notice[0]};
+  }
+  return notice.every(function (time_constraint, index) {
+    return (index < checkTimesFrom) || AdvanceTime(time_constraint, then);
+  });
+}
+	
 function UniqueEntriesInKey(service, key, seen) {
     "use strict";
     if (service.hasOwnProperty(key)) {
@@ -150,7 +356,7 @@ function showUniqueKey(services, key) {
     services.forEach(function (service) {
         UniqueEntriesInKey(service, key, seen);
     });
-    seen.forEach(function (value) { document.write(value + "<br />\n"); });
+    seen.forEach(function (value) { document.write(value + "<br/>--<br />\n"); });
     document.write("Stufffff<br/>");
 }
 
@@ -158,15 +364,25 @@ function withServices(knowns) {
     "use strict";
     return function (services) {
         "use strict";
+        showUniqueKey(services, "advance-notice-notes");
+
         var results = AvailableServices(services, knowns);
         document.write("Results: " + results + "<br/>\n");
-        var filtered = results.complete;
-        document.write("Services matching: ");
-        document.write(filtered.length + "<br/>");
-        filtered.forEach(function (service, i) {
+        var complete = results.complete;
+        document.write("<p>Services matching: ");
+        document.write(complete.length + "<br/>");
+        complete.forEach(function (service, i) {
             document.write("Service " + (i + 1) + ": ");
             document.write(service.title + "<br/>");
         });
+        var incomplete = results.incomplete;
+        document.write("</p>\n<p>Services partially matching: ");
+        document.write(incomplete.length + "<br/>");
+        incomplete.forEach(function (service, i) {
+            document.write("Service " + (i + 1) + " (" + service.incomplete + "): ");
+            document.write(service.service.title + "<br/>");
+        });
+        document.write("</p>\n");
     };
 }
     </script>
