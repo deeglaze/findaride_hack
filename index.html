@@ -554,7 +554,9 @@
         }
 
         function hideLayersInitial() {
-            if (!dartPickupAreas.docs[0] || !transitRoutes.docs[0]) {
+            if (!dartPickupAreas.docs[0] ||
+                !transitRoutes.docs[0] ||
+                !hydeShuttles.docs[0]) {
                 setTimeout(hideLayersInitial, 1000);
                 return;
             }
